@@ -1,99 +1,100 @@
 # PayLedger — Digital Wallet & Immutable Financial Ledger API
 
-API de carteira digital e ledger financeiro imutável construída em **Java 21 + Spring Boot 3**, projetada com foco em **consistência transacional, idempotência, controle de concorrência, mensageria resiliente e testes reais com Testcontainers**.
+A production-oriented digital wallet and immutable double-entry ledger API built with **Java 21 + Spring Boot 3**, focused on **transactional consistency, idempotency, concurrency safety, resilient asynchronous messaging, and real-database integration testing with Testcontainers**.
 
 ---
 
-## Arquitetura
+## Architecture
 
 ```mermaid
 flowchart LR
-    Client["Cliente / Swagger / k6"] -->|"HTTPS + JWT + Idempotency-Key"| API["PayLedger API (Spring Boot 3)"]
-    API -->|"Pessimistic Lock + Double-Entry Ledger"| PG[("PostgreSQL 16 + Flyway")]
+    Client["Client / Swagger / k6"] -->|"HTTPS + JWT + Idempotency-Key"| API["PayLedger API (Spring Boot 3)"]
+    API -->|"Ordered Pessimistic Lock + Double-Entry Ledger"| PG[("PostgreSQL 16 + Flyway")]
     API -->|"AFTER_COMMIT Event"| EX["RabbitMQ: payledger.events.exchange"]
     EX --> Q["payledger.transfer.notifications.queue"]
-    Q -->|"Consumo + Retry (3x Backoff)"| Consumer["TransferNotificationConsumer"]
-    Q -->|"Após 3 falhas"| DLX["payledger.dlx.exchange"]
+    Q -->|"Consume + Retry (3x Backoff)"| Consumer["TransferNotificationConsumer"]
+    Q -->|"After 3 failures"| DLX["payledger.dlx.exchange"]
     DLX --> DLQ["payledger.transfer.notifications.dlq"]
 ```
 
 ---
 
-## Decisões Técnicas & Trade-offs
+## Key Engineering Decisions & Trade-offs
 
-| Desafio | Decisão adotada | Por quê? |
+| Challenge | Decision | Why? |
 | --- | --- | --- |
-| **Precisão monetária** | `BigDecimal` + `NUMERIC(19,2)` + `RoundingMode.HALF_EVEN` | Elimina erros de ponto flutuante (`double`/`float`) em cálculos financeiros. |
-| **Auditoria de saldo** | `wallets` (saldo atual) + `ledger_entries` (partida dobrada imutável) | Leitura rápida de saldo combinada com histórico auditável onde nunca há `UPDATE`/`DELETE`. |
-| **Cobrança dupla / Retries de rede** | Header `Idempotency-Key` + constraint `UNIQUE` no PostgreSQL | Reenvios da mesma intenção retornam a transação original sem debitar novamente. |
-| **Race condition & Deadlock** | `PESSIMISTIC_WRITE` (`SELECT ... FOR UPDATE`) ordenado pelo menor `UUID` | Impede saldo negativo sob alta concorrência e elimina deadlocks em transferências cruzadas (`A -> B` e `B -> A`). |
-| **Consistência entre DB e Fila** | `@TransactionalEventListener(phase = AFTER_COMMIT)` | Só publica o evento no RabbitMQ após o commit confirmado no PostgreSQL. |
-| **Resiliência de notificações** | Retry exponencial (3 tentativas) + Dead Letter Queue (DLQ) | Falhas externas não quebram a transferência nem perdem eventos. |
-| **Performance JPA** | `Persistable<UUID>` + `open-in-view: false` + `@EntityGraph` | Evita `SELECT` extra antes de `INSERT` e elimina consultas N+1 no extrato. |
-| **Padronização de erros** | `@RestControllerAdvice` com `ProblemDetail` (RFC 7807) | Contrato consistente de erros (`400`, `401`, `404`, `409`, `422`). |
+| **Monetary precision** | `BigDecimal` + `NUMERIC(19,2)` + `RoundingMode.HALF_EVEN` | Eliminates floating-point precision bugs (`double`/`float`) in financial calculations. |
+| **Auditability vs. read speed** | `wallets` (current balance) + `ledger_entries` (immutable double-entry log) | Fast balance lookups combined with an append-only audit trail (`UPDATE`/`DELETE` never touch ledger history). |
+| **Duplicate charges / network retries** | `Idempotency-Key` header + `UNIQUE` DB constraint | Retried requests return the original transaction without debiting or crediting twice. |
+| **Race conditions & deadlocks** | `PESSIMISTIC_WRITE` (`SELECT ... FOR UPDATE`) ordered by ascending `UUID` | Prevents overspending under concurrency and eliminates deadlocks during simultaneous cross-transfers (`A -> B` and `B -> A`). |
+| **Hibernate 1st-level cache staleness** | Scalar projection (`findIdByUserId`) before locking | Ensures the `Wallet` entity is only loaded into the Persistence Context *after* acquiring the pessimistic lock, always reading fresh balance and `@Version`. |
+| **DB-to-Broker consistency** | `@TransactionalEventListener(phase = AFTER_COMMIT)` | Publishes RabbitMQ events only after PostgreSQL commits, avoiding ghost notifications on rollbacks. |
+| **Notification resilience** | Exponential backoff retry (3 attempts) + Dead Letter Queue (DLQ) | External notification failures never block transfers or lose events. |
+| **JPA performance** | `Persistable<UUID>` + `open-in-view: false` + `@EntityGraph` | Avoids extra `SELECT` before `INSERT` on pre-assigned UUIDs and eliminates N+1 queries on paginated statements. |
+| **Standardized errors** | `@RestControllerAdvice` with RFC 7807 `ProblemDetail` | Predictable, machine-readable error contracts (`400`, `401`, `404`, `409`, `422`). |
 
 ---
 
-## Stack
-- **Java 21** (Records, Pattern Matching) & **Spring Boot 3.4**
+## Tech Stack
+- **Java 21** (Records, modern standard library) & **Spring Boot 3.4**
 - **PostgreSQL 16** + **Flyway** (`ddl-auto: validate`)
 - **Spring Security** + **JWT** (stateless, BCrypt)
-- **RabbitMQ 3.13** (Exchange, Retry com backoff exponencial e DLQ)
+- **RabbitMQ 3.13** (Direct Exchange, Exponential Backoff Retry, Dead Letter Queue)
 - **Springdoc OpenAPI / Swagger UI**
-- **JUnit 5**, **Mockito**, **Testcontainers** e **k6**
-- **Docker** (multi-stage build com usuário não-root) & **GitHub Actions CI**
+- **JUnit 5**, **Mockito**, **Testcontainers**, and **k6**
+- **Docker** (multi-stage build with non-root user) & **GitHub Actions CI**
 
 ---
 
-## Como rodar localmente
+## Running Locally
 
-### 1. Suba PostgreSQL e RabbitMQ
+### 1. Start PostgreSQL and RabbitMQ
 ```bash
 docker compose up -d
 ```
 
-### 2. Rode a aplicação
+### 2. Run the application
 ```bash
 mvn spring-boot:run
 ```
 
-### 3. Acesse os painéis
+### 3. Access interactive UIs
 - **Swagger UI:** http://localhost:8080/swagger-ui.html
 - **Health Check:** http://localhost:8080/actuator/health
-- **RabbitMQ Management:** http://localhost:15672 (usuário `payledger` / senha `payledger_secret`)
+- **RabbitMQ Management:** http://localhost:15672 (user `payledger` / password `payledger_secret`)
 
 ---
 
-## Endpoints
+## API Endpoints
 
-| Método | Rota | Auth | Descrição |
+| Method | Endpoint | Auth | Description |
 | --- | --- | --- | --- |
-| `POST` | `/api/v1/auth/register` | Público | Cadastra usuário e cria carteira com saldo `0.00` |
-| `POST` | `/api/v1/auth/login` | Público | Autentica e retorna JWT |
-| `GET` | `/api/v1/wallets/me` | JWT | Consulta carteira e saldo atual |
-| `POST` | `/api/v1/wallets/deposit` | JWT + `Idempotency-Key` | Deposita valor e registra crédito no ledger |
-| `POST` | `/api/v1/transfers` | JWT + `Idempotency-Key` | Transfere com lock anti-deadlock e partida dobrada |
-| `GET` | `/api/v1/wallets/me/statement` | JWT | Extrato paginado (`direction`, `from`, `to`, `page`, `size`) |
+| `POST` | `/api/v1/auth/register` | Public | Registers a user and provisions a wallet with `0.00` balance |
+| `POST` | `/api/v1/auth/login` | Public | Authenticates user and returns a JWT |
+| `GET` | `/api/v1/wallets/me` | JWT | Returns the authenticated user's wallet and balance |
+| `POST` | `/api/v1/wallets/deposit` | JWT + `Idempotency-Key` | Credits funds and appends a `CREDIT` ledger entry |
+| `POST` | `/api/v1/transfers` | JWT + `Idempotency-Key` | Transfers funds with deadlock-free locking and double-entry ledger |
+| `GET` | `/api/v1/wallets/me/statement` | JWT | Paginated statement with optional filters (`direction`, `from`, `to`, `page`, `size`) |
 
 ---
 
-## Testes
+## Testing & Verification
 
-### Testes Unitários + Integração & Concorrência (Testcontainers)
-Com o Docker rodando:
+### Unit, Integration & Concurrency Tests (Testcontainers)
+With Docker running:
 ```bash
 mvn test
 ```
-O [PayLedgerIntegrationTest.java](src/test/java/com/payledger/PayLedgerIntegrationTest.java) sobe um **PostgreSQL 16 real em container**, executa as migrations do Flyway e valida:
-- Fluxo E2E completo (registro → depósito → transferência → extrato)
-- Idempotência sob requisições duplicadas
-- **Concorrência real:** 10 threads simultâneas tentando transferir `20.00` de uma carteira com saldo `100.00` — provando que exatamente **5** passam, **5** recebem `422` e o saldo nunca fica negativo.
+[PayLedgerIntegrationTest.java](src/test/java/com/payledger/PayLedgerIntegrationTest.java) spins up a real **PostgreSQL 16** container, runs Flyway migrations, and verifies:
+- End-to-end flow (register → deposit → transfer → paginated statement)
+- Idempotency under duplicate `Idempotency-Key` requests
+- **High concurrency:** 10 simultaneous threads attempting to transfer `20.00` each from a wallet with `100.00` — proving exactly **5** succeed (`201`), **5** are rejected (`422`), and the balance never goes negative.
 
-### Demonstração de Retry + DLQ no RabbitMQ
-Envie uma transferência contendo `[FAIL_NOTIFICATION]` no campo `description`. O consumer executará 3 tentativas com backoff exponencial e encaminhará a mensagem JSON intacta para a fila `payledger.transfer.notifications.dlq`.
+### Demonstrating Retry + DLQ in RabbitMQ
+Send a transfer whose `description` contains `[FAIL_NOTIFICATION]`. The consumer retries 3 times with exponential backoff and automatically routes the intact JSON payload to `payledger.transfer.notifications.dlq`.
 
-### Teste de Carga (k6)
-Com a API rodando localmente e o [k6](https://k6.io/) instalado:
+### Load Testing (k6)
+With the API running locally and [k6](https://k6.io/) installed:
 ```bash
 k6 run loadtest/transfer-load-test.js
 ```
